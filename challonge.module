@@ -1,13 +1,7 @@
 <?php
-    /**Notes: when we need to cache
-       1) Matches should be cached after
-    */
     require_once(dirname(__FILE__) . '/lib/challonge.php');
     module_load_include('inc', 'node', 'node.pages');
     ChallongeAPI::$api_key = variable_get('challonge_api_key', '');
-
-    $challonge_has_matches;
-    $challonge_match_count;
 
     //TODO: most of these helper functions could probably be refactored into the challonge
    //library.
@@ -34,32 +28,64 @@
     function helper_publish_tournament($tournament_id)
     {
         $tournament = new ChallongeTournament();
-        return $tournament->reqPublish($tournament_id); 
+        $return_xml = $tournament->reqPublish($tournament_id); 
+        if(!$return_xml->error){
+            db_query("UPDATE {challonge_tournament} SET is_published = 1 WHERE tournament_id = '%s'", $tournament_id);
+        }
+        return $return_xml;
     }
 
     function helper_start_tournament($tournament_id)
     {
         $tournament = new ChallongeTournament();
-        return $tournament->reqStart($tournament_id);
+        $return_xml = $tournament->reqStart($tournament_id);
+        if(!$return_xml->error){
+            db_query("UPDATE {challonge_tournament} SET is_started = 1 WHERE tournament_id = '%s'", $tournament_id);
+        }
+        return $return_xml;
     }
 
     function helper_get_matches($tournament_id, $active_only = FALSE)
     {
         $matches = new ChallongeMatch($tournament_id);	
         $matches_xml = $matches->reqIndex();
-        if(!$active_only){
+
+        if($matches_xml->error){
             return $matches_xml;
+        }
+        $query = db_query("SELECT match_id FROM {challonge_matches} WHERE tournament_id = %d ", $tournament_id);
+        $match_ids = array();
+        //Get all the ids from the matches we already have.
+        while($foo =  db_fetch_object($query)){
+             $match_ids[] = (string) $foo->match_id;
         }
         $match_array = array();
 
         foreach($matches_xml as $match){
+            //TODO: figure out if we can have a match without two players. 
+            $player1_id= $match->xpath("player1-id");
+            $player2_id= $match->xpath("player2-id");
+
+            $player1_id = (string) $player1_id[0]; 
+            $player2_id = (string) $player2_id[0]; 
+            $match_id = (string)$match->id;
+
+            if(!(in_array($match_id, $match_ids))){
+                //if the match isn't in the database, add it.
+                 db_query("INSERT into {challonge_matches} (match_id, tournament_id) VALUES (%d, %d)", 
+                           $match_id, $tournament_id);
+                 db_query("INSERT into {match_participants} (match_id, participant_id, seed) VALUES (%d, %d, 1), (%d, %d, 2)",
+                           $match_id, $player1_id, $match_id, $player2_id);
+            }
             //skip if the match has already been played.
-            $state = $match->xpath("state");
-            $state = $state[0];
+            $state = $match->state;
             if($state != "open"){
                 continue;
             }
             $match_array[] = $match;
+        }
+        if(!$active_only){
+            return $matches_xml;
         }
         return $match_array;
     }
@@ -96,45 +122,52 @@
         $participant = new ChallongeParticipant($tournament_id);
         $participant->setParams($participant_params);
         $participant_xml = $participant->reqCreate();
+        if($participant_xml->error){
+            return $participant_xml;
+        }
         $participant_id = $participant_xml->id;
-        //TODO: error handling
-        db_query("INSERT INTO {challonge_participants} (participant_id, tournament_id, 'name') 
-                 VALUES (%s, %s, %s)", 
+        db_query("INSERT INTO {challonge_participants} (participant_id, tournament_id, name) 
+                 VALUES (%d, %d, '%s')", 
                  $participant_id, $tournament_id, $user->$char_name_field);
         return $participant_xml;
     }
 
     /**
      * Helper function that returns an array of participants
-     * in ACTIVE matches. Return NULL if there are none.
+     * in matches. Return NULL if there are none.
      */
-    function helper_get_participants($matches, $tournament_id)
+    function helper_get_participants($tournament_id, $matches = NULL)
     {
+        //TODO: what if participants are in the tournament but not in our module?
         $participant_array = array();
         if($matches == NULL){
-            return NULL;
+            $query = db_query("SELECT * FROM {challonge_participants} WHERE tournament_id = %d", $tournament_id);
+            while($object = db_fetch_object($query)){
+               $participant_array[] = $object->name;
+            }
+            return array('participants' => $participant_array);
         } 
-        //TODO: rewrite the following loop as an SQL statement. 
+
         foreach($matches as $match)
         {
-            //Get the two player info for the current matches.
-            $player1_id = $match->xpath("player1-id");
-            $player1_id = $player1_id[0];
-
-            $player2_id = $match->xpath("player2-id");
-            $player2_id = $player2_id[0];
-
-            $participant = new ChallongeParticipant($tournament_id);
-            //TODO: access info from the cache.
-            if($player1_id != ''){
-                $player_1_xml = $participant->reqShow($player1_id);
-                $player1 = (string)$player_1_xml->name;
+            $match_id = (string) $match->id;
+            $query = db_query("SELECT seed, name, {challonge_participants}.participant_id FROM {challonge_participants}
+                               JOIN {match_participants} ON {challonge_participants}.participant_id = {match_participants}.participant_id
+                               WHERE match_id = %d", $match_id);
+            $players = array();
+            while($player = db_fetch_object($query)){
+                if($player->seed == 1){
+                    $player1_id = $player->participant_id;
+                    $player1 = $player->name; 
+                }
+                else{
+                    //var_dump($player);
+                    $player2_id = $player->participant_id;
+                    $player2 = $player->name; 
+                }
             }
-            if($player2_id != ''){
-                $player_2_xml = $participant->reqShow($player2_id);
-                $player2 = (string)$player_2_xml->name;
-            }
-            $participant_array[] = array(((string)$player1_id) => $player1,((string)$player2_id)=> $player2);
+             
+            $participant_array[] = array($player1_id => $player1, $player2_id => $player2);
             //Getting the match id for each participant is a good thing.
             $return_array[] = array('match_id'=>(string)$match->id,'participants'=> $participant_array);
         }
@@ -191,6 +224,19 @@
     }
 
     /**
+     * Implementation of hook_access().
+     */
+    function challonge_access($op, $node, $account){
+      switch($op){
+        case 'create':
+          return user_access('create tournaments', $account) || (user_access('administer challonge'))  && $account->uid ? TRUE : NULL;
+        case 'update':
+          return user_access('administer challonge') || (user_access('create tournaments', $account)) && ($node->uid == $account->uid) ?TRUE : NULL;
+        case 'delete':
+          return user_access('administer challonge') || (user_access('create tournaments', $account)) && ($node->uid == $account->uid) ?TRUE : NULL;
+      }
+    }
+    /**
      * Implementation of hook_menu
      */
     function challonge_menu()
@@ -212,18 +258,23 @@
                                              'access arguments' => array('join tournaments'),
                                              'type' => MENU_CALLBACK
         );
-        $items['challonge/test'] = array(
-                                      'title' => t('test'),
-                                      'access arguments' => array('join tournaments'),
-                                      'page callback' => 'challonge_test',
-                                      'type' => MENU_CALLBACK
-                                     );
+
+        $items['node/%challonge_menu_seeds/manage_seeds'] = array(
+                                                         'title' => t('Manage seeds'),
+                                                         'description' => t('Sets the order of seeds for the tournament'),
+                                                         'page callback' => 'challonge_seeds', 
+                                                         'page arguments' => array(1),
+                                                         'access arguments' => array('create tournaments'),
+                                                         'type' => MENU_LOCAL_TASK
+                                                     );
+
         $items['node/%challonge_menu_publish/publish'] = array(
             'title' => t('Publish'),
             'description' => t('Initiates the publish action on Challonge.'),
             'file' => 'challonge.pages.inc',
             'page callback' => 'drupal_get_form',
             'page arguments' => array('challonge_publish_confirm', 1),
+            //TODO: access callback.
             'access arguments' => array('publish tournaments'),
             'type' => MENU_LOCAL_TASK
         );
@@ -233,6 +284,7 @@
             'file' => 'challonge.pages.inc',
             'page callback' => 'drupal_get_form',
             'page arguments' => array('challonge_start_confirm', 1),
+            //TODO: access callback.
             'access arguments' => array('start tournaments'),
             'type' => MENU_LOCAL_TASK
         );
@@ -246,11 +298,9 @@
         {
             return false;
         }
-        $tournament = new ChallongeTournament();
-        $xml = $tournament->reqShow($node->tournament_id);
-        $published_at = $xml->xpath('published-at');
-        if ($published_at[0]['nil'] != "true")
-        {
+        $is_published= db_query('SELECT is_published FROM {challonge_tournament} WHERE nid = %d', $nid);
+        $result = (int) db_result($is_published);
+        if($result){
             return false;
         }
         return $node;
@@ -263,16 +313,26 @@
         {
             return false;
         }
-        $tournament = new ChallongeTournament();
-        $xml = $tournament->reqShow($node->tournament_id);
-        $started_at = $xml->xpath('started-at');
-        if ($started_at[0]['nil'] != "true")
+        $is_published = db_query('SELECT is_started FROM {challonge_tournament} WHERE nid = %d', $nid);
+        $result = (int)db_result($is_published);
+        if($result)
         {
             return false;
         }
         return $node;
     }
 
+    function challonge_seeds($nid)
+    {
+        $node = node_load($nid);
+        if (empty($node->type) || $node->type != 'tournament')
+        {
+            return false;
+        }
+        var_dump($node); 
+        //TODO: finish this function.
+        return "foo";
+    }
     /**
      * Implementation of hook_node_info
      */
@@ -293,7 +353,7 @@
     function challonge_delete(&$node)
     {
         $tournament = new ChallongeTournament();
-        $xml = $tournament->reqDestroy($node->url);
+        $xml = $tournament->reqDestroy($node->tournament_id);
         if($xml->error){
             drupal_set_message(t('Unable to delete the tournament from the Challonge account.'), 'error');
         } 
@@ -416,24 +476,29 @@
      */
     function theme_challonge_view($node, $teaser = FALSE, $page = FALSE)
     {
+        //TODO: refactor this code. Perhaps to a template?
         $output = '<iframe src="http://challonge.com/'.$node->url.'/module?width=600&height=600" 
                                width="600" height="600" frameborder="0" scrolling="no"></iframe>';
         if($page){
-            /* Code is too damn slow
             $output .= "<h3 id='current_matches'> Current Matches </h3>";
             $output .= "<ul id='challonge_matches'>";
-            $matches = helper_get_matches($node->url);
-            $match_participants = helper_get_participants($matches, $node->url); 
-            var_dump($match_participants);
-
-            foreach($match_participants as $participant)
-            {
-                $output .= "<li class='challonge_match'> <span class='player1'>".$participant['player1'].
-                           "</span> <span class='vs'> VS </span> <span class='player2'>". $participant['player2'] . "</span> </li>";
+            $matches = helper_get_matches($node->tournament_id, true);
+            $match_participants = helper_get_participants($node->tournament_id, $matches); 
+            //var_dump($match_participants);
+            if($matches == NULL){
+                $output .= "<p class='challonge_no_matches'> No active matches </p>";
+            }
+            else{
+                foreach($match_participants as $match)
+                {
+                    $participants = $match['participants'][0];
+                    $participant_keys = array_keys($participants);
+                    $output .= "<li class='challonge_match'> <span class='player1'>".$participants[$participant_keys[0]].
+                               "</span> <span class='vs'> VS </span> <span class='player2'>". $participants[$participant_keys[1]] . "</span> </li>";
+                }
             }
             //Join tournament link.
             $output .= "</ul>";
-            */
         }
         $output .= "<div id='join'>". l(t('Click here to join this tournament'), 'challonge_join/'.$node->nid). "</div>";
         return $output;
@@ -502,9 +567,9 @@
              );
 
              //Match reporting.
-             $matches = helper_get_matches($node->url, TRUE);
+             $matches = helper_get_matches($node->tournament_id, TRUE);
              $options = array();
-             $participants = helper_get_participants($matches, $node->url);
+             $participants = helper_get_participants($node->tournament_id, $matches);
 
              $match_count = sizeof($matches);
              for($i = 0; $i < $match_count; $i++)
@@ -566,7 +631,7 @@
              //We can't join a tournament that's not there.
              return theme('challonge_join', 'Unable to find the tournament with the id ' . $node->url);
         }
-        $participant = helper_add_participant($node->url, $user->uid);
+        $participant = helper_add_participant($node->tournament_id, $user->uid);
         if($participant->error)
         {
              return theme('challonge_join', $participant->error);
